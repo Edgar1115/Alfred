@@ -62,6 +62,17 @@ tombstone (
   row_id: string (PK)
   deleted_at: datetime
 )
+
+sync_profile (
+  id: string (PK)
+  account_id: string (FK)     // 官方账号或自建账号
+  mode: string                // 'cloud'（官方托管）| 'self_hosted'（自建 relay）
+  endpoint: string?           // 自托管时填 relay URL；Cloud 用官方默认
+  auth_provider: string       // 'official' | 'self'
+  llm_provider: string        // 'official' | 'self_key' | 'local'
+  asr_provider: string        // 'local' | 'official' | 'custom'
+  created_at / updated_at
+)
 ```
 
 ### 2.1 User 用户档案（个人偏好）
@@ -151,14 +162,44 @@ memory_fact (
   id, user_id
   type: string        // 'relationship' / 'preference' / 'fact' / 'commitment'
   content: string     // "奶奶喜欢龙井"
-  summary: string?    // 语义向量依据
+  summary: string?    // 语义摘要
   embedding: blob?    // 向量
-  source: string      // 'conversation' / 'user_added'
+  source: string      // 'conversation' / 'silent_absorb' / 'user_added'
   confidence: float
   remind_at: datetime? // 若为 commitment，需要主动提醒的时间
   created_at / updated_at / last_seen_at
 )
 ```
+
+> `source='silent_absorb'` 表示由常驻聆听"静默吸收"写入（用户未显式要求记录）；此类记忆默认低打扰、可一键筛选查看与删除。
+
+### 2.7 常驻聆听相关（待确认 / 审计）
+
+```
+pending_confirmation (
+  id: string (PK)
+  user_id: string (FK)
+  intent: json          // 待确认的委托结构（解析后的 Schedule / Finance 等）
+  original_text: string // 用户原话（转写文本）
+  status: string        // 'asking' / 'confirmed' / 'rejected' / 'expired'
+  created_at: datetime  // 进入确认态时间
+  confirmed_at: datetime?
+)
+
+listen_audit (
+  id: string (PK)
+  device_id: string
+  heard_at: datetime        // 语音话段时间
+  classification: string    // '委托' / '吸收' / '忽略'
+  silent: bool              // 是否静默吸收/忽略
+  text: string              // 转写文本（敏感：仅本地，不上云）
+  cause: string?            // 丢弃或误判时可选备注
+)
+```
+
+- `pending_confirmation`：委托确认的核心状态存储——**确认成功才转写正式记录**（schedule/finance），未确认绝不落正式表
+- `listen_audit`：常驻聆听的**本地审计**（默认不上云、不参与同步），用于追溯误判、调优分类器；用户可一键清空
+- **隐私**：两类表均为本地数据，不进入同步 oplog（audit 尤其敏感）
 
 ## 3. 关系与引用规则
 
@@ -198,6 +239,8 @@ memory_fact (
 | 两端修改同一条记录 | LWW：更新时间较新者胜出（设备时钟偏差用逻辑时钟兜底） |
 | 一端删除 | 写 tombstone，广播后各端物理清除 |
 | 网络恢复 | 拉取远端 oplog → 按表应用 → 回执 ack → 清空本地已确认队列 |
+
+**双版本下的同步**：同步语义与部署形态无关。Cloud 版同步经官方 relay；**self_hosted 版**的 `sync_profile.endpoint` 指向自建 relay，同一套 oplog/tombstone/LWW 协议照常工作。**未配置任何 relay** 时降级为纯本地（单机）模式，所有端能力不下降。
 
 **提醒的一致性**：提醒由各端本地调度器触发，不依赖云端补发；跨端重复提醒容忍（行业常见做法是先去重标识，后续优化）。
 

@@ -84,6 +84,7 @@ users (
   name: string
   timezone: string
   preferences: json         // 偏好结构化（咖啡、饮食等）
+                          // 含 default_input_mode: 'voice' | 'text'（默认 'voice'）
   created_at: datetime
   updated_at: datetime
 )
@@ -171,15 +172,15 @@ memory_fact (
 )
 ```
 
-> `source='silent_absorb'` 表示由常驻聆听"静默吸收"写入（用户未显式要求记录）；此类记忆默认低打扰、可一键筛选查看与删除。
+> `source='silent_absorb'` 表示由 Agent 决策 `remember` → 记忆工具静默写入（用户未显式要求记录）；此类记忆默认低打扰、可一键筛选查看与删除。
 
-### 2.7 常驻聆听相关（待确认 / 审计）
+### 2.7 Agent 决策与审计相关
 
 ```
 pending_confirmation (
   id: string (PK)
   user_id: string (FK)
-  intent: json          // 待确认的委托结构（解析后的 Schedule / Finance 等）
+  tool_call: json       // 待确认的 Tool Call / Agent 决策（如 schedule.create 参数）
   original_text: string // 用户原话（转写文本）
   status: string        // 'asking' / 'confirmed' / 'rejected' / 'expired'
   created_at: datetime  // 进入确认态时间
@@ -190,15 +191,16 @@ listen_audit (
   id: string (PK)
   device_id: string
   heard_at: datetime        // 语音话段时间
-  classification: string    // '委托' / '吸收' / '忽略'
-  silent: bool              // 是否静默吸收/忽略
+  classification: string    // 'respond' / 'act' / 'remember' / 'ignore' / 'ask'
+  silent: bool              // 是否静默（remember 静默写入 / ignore）
   text: string              // 转写文本（敏感：仅本地，不上云）
-  cause: string?            // 丢弃或误判时可选备注
+  tool_call: json?          // act 时记录对应的 Tool Call
+  cause: string?            // 拒绝 / 误判时可选备注
 )
 ```
 
-- `pending_confirmation`：委托确认的核心状态存储——**确认成功才转写正式记录**（schedule/finance），未确认绝不落正式表
-- `listen_audit`：常驻聆听的**本地审计**（默认不上云、不参与同步），用于追溯误判、调优分类器；用户可一键清空
+- `pending_confirmation`：**act 决策需确认时的核心状态存储**——Tool Call 经用户确认后才转正式记录（schedule/finance），未确认绝不落正式表
+- `listen_audit`：Agent 决策的**本地审计**（默认不上云、不参与同步），用于追溯误判、调优 Agent 提示词与规则；用户可一键清空
 - **隐私**：两类表均为本地数据，不进入同步 oplog（audit 尤其敏感）
 
 ## 3. 关系与引用规则

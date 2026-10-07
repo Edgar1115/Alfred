@@ -152,11 +152,10 @@ alfred_app/                        # Flutter 项目（macOS/Win/Linux + iOS/Andr
 [常驻聆听] 持续采集(麦克风) → VAD 检测说话 → 语音片段
    → 本地 ASR 转文本 → **Attention Gate**（本地轻量：滤无语音/噪声/低质量转写）
    → 进入 Agent Loop（业务决策全部由 Agent 完成）
-       ├── respond → 直接回答对话
-       ├── ask    → 追问澄清
-       ├── act    → 走 Tool + Policy 确认门 → 执行
-       ├── remember → 调记忆工具静默写入（不打断）
-       └── ignore  → 丢弃，不打扰、不记录
+       ├── FINAL_RESPONSE → 直接回答对话 / 卡片
+       ├── CLARIFY       → 追问澄清（ask 类）
+       ├── TOOL_CALL     → 工具执行（act 写操作经 Policy 确认门；query 直接执行）
+       └── IGNORE        → 丢弃，不打扰、不记录
 ```
 
 - **常驻 VS 唤醒**：默认常驻聆听（无唤醒词等待）；唤醒词/按键作为"希望能立刻回应"时的增强入口
@@ -170,50 +169,79 @@ alfred_app/                        # Flutter 项目（macOS/Win/Linux + iOS/Andr
 
 **隐私基线（常驻聆听）**：不传原始音频上云（本地转写即丢弃）；界面常驻「聆听中」指示；一键闭麦；可彻底关闭常驻聆听退回按键触发。
 
-### 3.2 Agent Runtime / Agent Loop（唯一智能决策核心）
+### 3.2 Agent Loop（唯一智能决策核心）
 
-Agent 是系统唯一的智能决策核心。它把理解、规划与执行调度收敛为一个循环：
+Agent 是系统唯一的智能决策核心。**决策分两层，互不混淆**：
+
+**第一层 · Agent Loop 控制状态**——决定循环下一步做什么，是唯一驱动 Loop 的信号：
+
+| 控制状态 | 含义 | 对 Loop 的影响 |
+|---------|------|--------------|
+| `TOOL_CALL` | 需要调用一个（或多个）工具 | 进入工具执行：注册表 → Policy → 执行 → Observation 回流 → 下一轮 |
+| `CLARIFY` | 信息不足，需用户补充 | 暂停，输出追问，等用户回答后回到 Loop |
+| `FINAL_RESPONSE` | 目标已达成（或可安全给出终止性回答） | 输出最终结果，结束本轮 |
+| `IGNORE` | 非目标输入 / 无需任何回应 | 静默结束，不产生 UI、不记录 |
+
+**第二层 · 业务意图标签**——标记 Agent 对一个 Tool Call 的「目的归属」，仅供记忆/审计/确认门参考，**不控制 Loop**：
+
+| 标签 | 含义 | 典型 Tool 调用 |
+|------|------|--------------|
+| act（办） | 修改数据的操作（写） | `schedule.create/update/delete`、`finance.record` |
+| query（查） | 只读查询 | `schedule.query`、`memory.search`、`weather.query` |
+| remember（记） | 静默写入记忆 | `memory.write`（`silent_absorb`） |
+| ask（问） | 需要用户补充 | （无工具调用，触发 CLARIFY） |
+| ignore（忽略） | 不应打扰 | （无工具调用，触发 IGNORE） |
+
+> 业务标签到 `TOOL_CALL` 的映射取决于 Agent 对工具本身的选定——**查询（query/read）天然无需确认门，写操作（act）才进 Policy 门**。
 
 ```
 while 目标未完成 且 迭代数 < MAX:
-  observation = 收集（用户消息 / 工具结果 / 记忆检索 / 环境事件）
-  decision   = LLM 推理（respond | ask | act | remember | ignore）
-  if decision == act:
-      tool_call = 选择工具 + 填充参数（Tool Registry）
-      通过 Policy 校验（权限 / 风险 / 确认门）
-      result    = tool_execute(tool_call)      # 确定性执行（Runtime）
-  else:
-    result = 输出或静默（respond / ask / remember / ignore）
-  observation <- result   # Observation 回流，进入下一轮
+  observation = build_context(用户消息 / 工具结果 / 记忆检索 / 环境事件)
+  step        = agent.step(observation)   # 输出：控制状态 + 可选 ToolCall / 最终回应
+  switch step.control:
+    case TOOL_CALL:
+        tool_call  = step.tool_call            # 由 agent 选定（含 意图标签）
+        通过 Policy 校验（权限 / 风险 / 需要确认的写操作）
+        result     = tool_execute(tool_call)  # 确定性执行（Runtime）
+        observation <- result
+    case CLARIFY:
+        输出追问 -> 等待用户补充 -> 回到 Loop
+    case FINAL_RESPONSE:
+        output(step.final)   # 结束本轮
+    case IGNORE:
+        静默结束，不产生 UI / 记录
 ```
+
+多步工具链在同一请求内循环完成——例如：
+`memory.search` → `schedule.query` → `weather.query` →（组合）→ `schedule.create` → `FINAL_RESPONSE`。
 
 - **统一入口**：无论语音转写、常驻聆听转写，还是键盘输入，都以 `UserMessage` 进入 Agent Loop
 - **默认输入模式**：由偏好 `default_input_mode`（voice / text）决定首屏输入条形态；会话中随时可手动切换
-- **决策集**：respond（直接回答）/ ask（追问）/ act（调用工具执行）/ remember（静默记忆）/ ignore（忽略）
-- **查询的默认出口是对话**：respond 类结果（日程/账目/清单/记忆）直接以对话卡片返回，不自动跳转管理页
-- **记忆注入**：Agent 需要在必要时主动调用记忆检索工具，而非每次全量注入上下文
+- **查询类工具（只读）不进确认门**：`schedule.query` 直接执行并返回 Observation，只有**写操作（act）**经 Policy 确认门
+- **查询的默认出口是对话**：FINAL_RESPONSE 直接以对话/卡片返回，不自动跳转管理页
+- **记忆注入**：Agent 在需要时主动调用 `memory.search`，而非每次全量注入上下文
 - 危险内容识别：对心理危机、医疗/法律敏感话题启用规则，优先给安全响应
 
-> Agent **没有直接写库/直接调系统能力的权限**；一切动作性输出都表达为 Tool Call，交给下方 Runtime 执行。
+> Agent **没有直接写库/直接调系统能力的权限**；一切动作都表达为 Tool Call，交给下方 Runtime 执行。
 
-### 3.2.1 Agent 决策与确认流（判断力的归属）
+### 3.2.1 意图标签与确认流（判断力的归属）
 
-对每一段输入，Agent 依据上下文做五类决策；**业务级"该办/该记/废话"判断完全归 Agent**，不再有独立的外部语义分类器：
+对每一段输入，Agent 依据上下文给 ToolCall 打上**业务意图标签**；业务级"该办/该记/该查/废话"判断完全归 Agent，不再有独立的外部语义分类器：
 
-| 决策 | 处理 |
-|----|------|
-| respond | 直接对话/卡片应答，不落库 |
-| ask | 信息不足，向用户追问澄清 |
-| act（办） | 走 Tool 调用，**经 Policy 确认门**后才执行，未确认不落库 |
-| remember（该记的） | 调记忆工具静默写入 memory，不进对话 |
-| ignore（废话） | 不产生任何 UI / 记录 |
+| 意图标签 | 处理 |
+|---------|------|
+| act（办） | 写操作，走 Tool 调用，**经 Policy 确认门**后才执行，未确认不落库 |
+| query（查） | 只读查询（schedule.query / memory.search / weather.query），直接执行返回结果，**不进确认门** |
+| remember（记） | 调记忆工具静默写入 memory，不进对话 |
+| ask（问） | 信息不足，向用户追问（触发 CLARIFY） |
+| ignore（不理） | 废话：不产生任何 UI / 记录（触发 IGNORE） |
 
-Agent 判断吸收轻量规则信号（"提醒/记/买/约/帮我"等执行信号，"我喜欢/奶奶/妈妈"等记忆信号）作为提示偏好，但**最终决策权在 Agent**。
+Agent 判断吸收轻量规则信号（"提醒/记/买/约/帮我"等执行信号，"我喜欢/奶奶/妈妈"等记忆信号）作为提示词，但**最终决策权在 Agent**。
 
-**确认状态机**（act 类，由 Policy Engine 强制把关，防误执行、可撤销）：
+**确认状态机**（仅 act 写操作，由 Policy Engine 强制把关，防误执行、可撤销）：
 
 ```
-act 决策 → Tool Call 进入确认态（轻提示）
+TOOL_CALL（act 写操作）→ 进入确认态（轻提示）
    → 运行时轻声复述："要记下『明晚 7 点健身』吗？"
    ├── 确认 → 工具执行（写本地 SQLite + oplog）→ 同步 → 完成
    ├── 否定 → 丢弃，不记录
@@ -222,7 +250,7 @@ act 决策 → Tool Call 进入确认态（轻提示）
 
 - act 未确认绝不落库；确认操作可随时撤销（undo）
 - remember 写入记忆但不进当前对话，用户随时可查、可删（管理页 / 对话内"我们上次记了什么"）
-- 误判兜底（AGT-05）：所有可确认可否决，所有记忆可删除
+- 误判兜底（AGT-05）：所有确认可否决，所有记忆可删除
 
 ### 3.3 工具层 (tools) + Tool Registry
 
@@ -356,18 +384,22 @@ interface MemoryStore {
 
 ```
 用户说话（无需唤醒）──▶ [常驻聆听] 麦克风持续采集
-        → VAD 检测到话段 → 本地 ASR → "明早 7 点提醒吃药"
+        → VAD 检测到话段 → 本地 ASR → 转写文本
         → Attention Gate（本地轻量：仅滤噪声/无语音，不做语义）
-        → 进入 Agent Loop
-            ├─ ignore → 丢弃（不打扰、不记录）
-            ├─ remember → 调用 memory.save 静默写入 → 完成（不打断）
-            ├─ respond/ask → 对话回答 / 追问
-            └─ act → 生成 Tool Call（schedule.create）→ 过 Policy 确认门
-        → 运行时轻声复述："要记下『明早 7 点提醒吃药』吗？"
-            ├─ 确认 → 工具执行 → 写本地 SQLite + 生成 Reminder
-            │          → oplog 排队（后台同步）→ UI 显示
-            ├─ 否定 → 丢弃
-            └─ 超时 → 再问 / 取消
+        → 进入 Agent Loop（控制层驱动）
+          ScheduleLoop（"明早 7 点提醒吃药"）：
+            step1 → TOOL_CALL（act | schedule.create）→ Policy 确认门
+            → 轻声复述："要记下『明早 7 点提醒吃药』吗？"
+                ├─ 确认 → 执行 schedule.create → 本地 SQLite + 生成 Reminder
+                │         → oplog 排队（后台同步）→ UI 显示 → FINAL_RESPONSE
+                ├─ 否定 → 丢弃，不记录
+                └─ 超时 → 再问 / 取消
+          MultiToolLoop（"我明天有什么安排，要下雨吗"）：
+            step1　TOOL_CALL（query | schedule.query）     ← 只读，不走确认门
+                  → Observation：明天有 3 个日程
+            step2　TOOL_CALL（query | weather.query）
+                  → Observation：明天下雨
+            step3　FINAL_RESPONSE → 组合回答（+提醒是否改期）
 ```
 
 ### 7.2 主动提醒（Active Reminder）

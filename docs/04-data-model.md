@@ -191,16 +191,17 @@ listen_audit (
   id: string (PK)
   device_id: string
   heard_at: datetime        // 语音话段时间
-  classification: string    // 'respond' / 'act' / 'remember' / 'ignore' / 'ask'
+  control_state: string     // 'TOOL_CALL' / 'CLARIFY' / 'FINAL_RESPONSE' / 'IGNORE'
+  classification: string    // 业务标签：'act' / 'remember' / 'query' / 'ask' / 'ignore'
   silent: bool              // 是否静默（remember 静默写入 / ignore）
   text: string              // 转写文本（敏感：仅本地，不上云）
-  tool_call: json?          // act 时记录对应的 Tool Call
+  tool_calls: json?         // 记录本轮 tool_call 序列（含每个调用的业务标签）
   cause: string?            // 拒绝 / 误判时可选备注
 )
 ```
 
-- `pending_confirmation`：**act 决策需确认时的核心状态存储**——Tool Call 经用户确认后才转正式记录（schedule/finance），未确认绝不落正式表
-- `listen_audit`：Agent 决策的**本地审计**（默认不上云、不参与同步），用于追溯误判、调优 Agent 提示词与规则；用户可一键清空
+- `pending_confirmation`：**act 写操作需确认时的核心状态存储**——Tool Call 经用户确认后才转正式记录（schedule/finance），未确认绝不落正式表；query/read 类工具调用不产生确认
+- `listen_audit`：Agent 决策的**本地审计**（默认不上云、不参与同步），同时记录**控制状态**（本轮循环如何结束）与**业务标签**（act/remember/query/ask/ignore），用于追溯误判、调优 Agent 提示词与规则；用户可一键清空
 - **隐私**：两类表均为本地数据，不进入同步 oplog（audit 尤其敏感）
 
 ## 3. 关系与引用规则

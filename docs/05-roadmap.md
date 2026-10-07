@@ -31,7 +31,7 @@
 - [ ] 本地提醒调度器（平台原生通知）
 - [ ] Policy 确认门 + 撤销（对话内完成，不跳表单页）
 - [ ] 零漏触发（启动补发）
-- [ ] 语音输入闭环：常驻聆听 + 本地 Whisper + VAD → Attention Gate → Agent 决策（act / remember / ignore / ask）
+- [ ] 语音输入闭环：常驻聆听 + 本地 Whisper + VAD → Attention Gate → Agent Loop（控制状态驱动 TOOL_CALL / CLARIFY / FINAL_RESPONSE / IGNORE，依意图标签 act / remember / query / ask 分流）
 - [ ] **act 确认闭环**："明早 8 点提醒吃药" → 轻声确认 → 确认后建日程（未确认不落库）
 - [ ] **remember 与 ignore**："奶奶喜欢龙井" Agent 决策静默入记忆；闲聊废话 Agent 决策 ignore 不打断
 - [ ] **对话内查询**："我下周有什么安排" → 对话卡片返回，不跳列表页
@@ -48,6 +48,7 @@
 > 旁边人闲聊"今天菜不错" → Agent 决策 ignore，完全无反应，不记录不打断 ✅
 > 随口说"我最近压力好大" → Agent 决策 remember，静默记情绪，不打断 ✅
 > **多轮 Agent Loop**：先问"我周五有空吗"→ 回答后再说"那帮我约周五 7 点健身" → 一个会话内多轮工具调用完成 ✅
+> **单请求多工具链**：问"我明天有什么安排，要下雨吗" → Agent 在一个请求内依次 schedule.query → weather.query → 组合回答，查询类工具不被确认门打断 ✅
 > 用户全程没离开对话页 ✅
 
 ## M2 账号 + 多端同步（P0）

@@ -34,6 +34,7 @@
 - [ ] 语音输入闭环：常驻聆听 + 本地 Whisper + VAD → Attention Gate → Agent Loop（控制状态驱动 TOOL_CALL / CLARIFY / FINAL_RESPONSE / IGNORE，依意图标签 act / remember / query / ask 分流）
 - [ ] **act 确认闭环**："明早 8 点提醒吃药" → 轻声确认 → 确认后建日程（未确认不落库）
 - [ ] **remember 与 ignore**："奶奶喜欢龙井" Agent 决策静默入记忆；闲聊废话 Agent 决策 ignore 不打断
+- [ ] **Memory 最小写入能力（M1 内）**：仅 `memory.upsert` 最小实现——写入 content/type/source，`silent_absorb` 落库可行即可；**完整 RAG / 检索 / supersede 属 M3，不在 M1 范围**
 - [ ] **对话内查询**："我下周有什么安排" → 对话卡片返回，不跳列表页
 - [ ] **输入切换闭环**：语音/文本一键切换，两种输入等价（都能建日程、查日程）
 - [ ] 平板/桌面/手机三种尺寸 UI 都覆盖对话主界面 + 日程查询
@@ -56,9 +57,10 @@
 **目标**：Alfred 是三端一管家，数据流动起来。
 
 - [ ] 账号系统（注册/登录/设备注册）
-- [ ] oplog 变更捕获 + 上传/拉取
-- [ ] 冲突解决（LWW + tombstone）
-- [ ] 云端 relay 服务（轻量）
+- [ ] oplog 变更捕获（`op_id` UUID + `device_seq` 游标）+ 上传/拉取
+- [ ] 冲突解决（LWW + tombstone，HLC 判胜）
+- [ ] 云端 relay 服务（轻量）：oplog 持久化 + snapshot 生成
+- [ ] 新设备 Bootstrap（下载 snapshot + 应用 oplog 增量）
 - [ ] 离线队列 + 网络恢复自动同步
 - [ ] 多设备登录同账号后自动合并
 
@@ -66,15 +68,21 @@
 > 手机新增日程 → 同一账号的平板自动出现 ✅
 > 平板删除日程 → 手机尊重删除（tombstone 生效）✅
 > 飞机模式期间在手机记一笔 → 开网后电脑出现该条 ✅
+> 新买 iPad 首次登录 → 不依赖电脑在线，直接拿到过去全部日程/记忆 ✅
 
-## M3 长期记忆与用户档案（P0）
+## M3 完整 Agentic Memory（P0）
 
-**目标**：Alfred 开始"记住你"。
+**目标**：从"能存能取"升级为"真正记住你"——混合检索、冲突/版本、画像沉淀。（M1 只留有最小 upsert 写入。）
 
-- [ ] Memory Tool：`memory.add` / `memory.search` / `memory.delete` + 语义检索（向量 + 摘要）
-- [ ] Agent 决策中自动抽事实（"我喜欢喝美式"）→ remember 归档
+- [ ] Memory Tool 四接口：`memory.upsert` / `memory.search` / `memory.list` / `memory.delete`
+- [ ] **完整 RAG 管道**：Query Analysis → Metadata Filter → FTS5+sqlite-vec 双路 → merge → dedupe → rerank（recency/confidence/importance/有效期） → Top-K → Observation
+- [ ] FTS5 + memory_embedding 双写（lexical 精确召回 + semantic 语义召回并存，同一 SQLite；embedding 独立表按模型版本）
+- [ ] **冲突 / 替代策略（supersede）**："我不喜欢美式了" → upsert 检测旧事实 → 新代旧，旧置 superseded（默认检索不返回）；provenance 可追溯
+- [ ] **画像构建（Profile building）**：memory_fact 按 type 汇聚 → 用户档案（偏好/关系/承诺），供 Agent 调用 memory.list 读取
+- [ ] Structured 检索工具分工：`schedule.query` / `finance.query` / `health.query` —— 确定性事实不 embedding，走精确查询
+- [ ] Agent 决策中自动抽事实（"我喜欢喝美式"）→ remember → memory.upsert 归档
 - [ ] 记忆修正（`忘记...` / `记住...`）
-- [ ] Agent 按需检索记忆注入上下文（而非每轮全量注入）
+- [ ] Agent 按需检索记忆注入上下文（而非每轮全量注入）；结果不足自动改写 query 重试
 - [ ] 语音唤醒词（"Hey Alfred"）+ 静音自动切断
 - [ ] 记忆参与同步（多端共享档案）
 - [ ] **对话内查记忆**："我奶奶喜欢喝什么茶" → Agent 调 memory.search → 对话卡片返回，无需打开档案页
@@ -83,8 +91,12 @@
 
 **验收**：
 > 对话说"我喜欢喝美式" → 隔天问"我喝什么咖啡" → 回答正确 ✅
-> "我不喜欢美式了" → 更新而非叠加 ✅
+> "我最近戒咖啡了" → 新记忆 supersede 旧记忆（旧事实保留 history 供追溯，默认不再返回"喜欢美式"）✅
+> 问"你为什么觉得我戒咖啡了" → 追溯 provenance：定位到那条消息与设备 ✅
 > 平板 Pro 上唤醒说"明天下午提醒交方案" → 全端可见 ✅
+> 问"我上周体检报告怎么说" → 语义检索命中记忆并引用原文 ✅
+> 问"我下周三下午有会吗" → 走 schedule.query 精确时间查询，**不触发语义 RAG** ✅
+> 问"我奶奶喜欢喝什么茶" → memory.search 双路召回，回答"龙井"并给出记录时间 ✅
 
 ## M4：财务 + 生活辅助（P1）
 
@@ -140,7 +152,7 @@
 |------|------|
 | LLM 时好时坏 | 核心动作 LLM + 规则双重校验；不依赖模型做执行 |
 | 提醒漏触发 | 本地调度器 + 启动补发；错误指标可追踪 |
-| 多端同步冲突 | LWW/墓碑；冲突可查询；先本地一致再同步 |
+| 多端同步冲突 | Row-level LWW（HLC）+ 墓碑；冲突可查询；先本地一致再同步 |
 | 语音识别错误 | 关键操作语音复述确认；可语音纠正 |
 | **Agent 误判（把废话当真 / 把真事当废话）** | act 过确认门后才执行；误判可回滚；remember 可删；`listen_audit` 追踪调优提示词/规则 |
 | **Agent Loop 失效 / 挂起** | 设最大迭代上限 + 超时降级（回落到纯规则极简集）；LLM 不可用时的可用路径单测 |

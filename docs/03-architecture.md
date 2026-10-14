@@ -5,8 +5,8 @@
 Alfred 是**跨三端（电脑 / 手机 / 平板）的完整应用**，采用 **Local-first** + 云端辅助的架构，并以**同源双发行**的方式呈现：
 
 - **端上（Flutter 应用）**：三端共用一套代码基座，自适应 UI；本地 SQLite 是主数据存储；语音、提醒、工具调用（包括 `invoke`）全部在端上运行（离线可用）。**只有一个客户端**。
-- **云端（协作服务）**：仅负责账号、AI 能力（LLM/ASR/同步中继），不做数据主权存储的单一事实源。云端是**可替换**的——既可指向官方服务（Cloud 版），也可由用户自建（Community 自托管版）。
-- **跨设备同步**：本地数据变更按序同步到云端，多端合并后下发，最终一致。
+- **云端（协作服务）**：仅负责账号、AI 能力（LLM/ASR/同步中继），不做业务权威事实源（Local SQLite 才是运行时事实源）。云端**可持久化同步副本**——oplog 全量 + snapshot——支撑**新设备 Bootstrap**（旧设备离线时新设备仍能重建历史）。云端是**可替换**的——既可指向官方服务（Cloud 版），也可由用户自建（Community 自托管版）。
+- **跨设备同步**：本地数据变更按序同步到云端，多端合并后下发，最终一致；新设备经 snapshot + oplog 增量重建（详见 04 §6.1）。
 - **构建形态**：同一代码库按 **Build Flavor / 配置注入**产出 `cloud` 与 `community` 两个构建；能力完全对齐，只有"基础设施由谁提供"不同。业务核心不复制、不分裂。
 
 **Agent-native**：**Agent 是系统唯一的智能决策核心**。它以 **结构化 Tool** 暴露日程、提醒、记忆、搜索、财务与设备能力；在 **Agent Loop** 中动态规划 → **Tool Calling** → **Observation（观察）** → 再决策，直到达成用户目标。确定性执行、安全权限与持久化由 **Agent 外部运行时（Runtime / Policy Engine）** 保障。
@@ -67,9 +67,9 @@ Alfred 是**跨三端（电脑 / 手机 / 平板）的完整应用**，采用 **
 
 **关键决策**：
 
-1. **本地是事实源**：SQLite 是每个端的主数据存储。云端不持有权威副本，只做多端间的「同步交换站」。断网、弱网、单端都不瘫痪。
+1. **本地是事实源**：SQLite 是每个端的主数据存储（客户端运行时事实源）。云端**不持有业务权威副本**（不是 CRUD 的最终一致性源），只做多端间的「同步交换站」（oplog / snapshot 中继）。但 relay **可以持久化同步副本**（oplog 全量 + 定期 snapshot），用于支撑**新设备 Bootstrap**——否则"云端只是中继"在新设备首次登录场景不闭环。断网、弱网、单端都不瘫痪。
 2. **三端一套代码基座**：用 Flutter，UI 层按平台自适应（断点 / 横竖屏），业务核心完全共享。适配异形屏、平板、桌面是设计目标而非事后补丁。
-3. **云端薄、端上可替换**：云端只做账号、LLM / ASR 网关、推送、同步合并中继；凡是能放端上的一律放端上，云端是可替换的（官方 / 自建）。
+3. **云端薄、端上可替换**：云端只做账号、LLM / ASR 网关、推送、同步中继（oplog 持久化 + snapshot，支撑 Bootstrap）；凡是能放端上的一律放端上，云端是可替换的（官方 / 自建）。
 4. **Agent 决策、运行时把关**：唯一智能决策核心是 Agent；权限、风险、确认、持久化由独立运行时（Policy Engine）负责，二者职责分离。
 5. **同源双发行**：社区自托管版与官方 Cloud 版共用同一 Flutter 客户端与同一 `core/`；仅通过 Provider / 构建配置注入基础设施（自带 LLM Key / 本地模型 / 自建 relay）。**能力零分裂**。
 
@@ -188,7 +188,7 @@ Agent 是系统唯一的智能决策核心。**决策分两层，互不混淆**�
 |------|------|--------------|
 | act（办） | 修改数据的操作（写） | `schedule.create/update/delete`、`finance.record` |
 | query（查） | 只读查询 | `schedule.query`、`memory.search`、`weather.query` |
-| remember（记） | 静默写入记忆 | `memory.write`（`silent_absorb`） |
+| remember（记） | 静默写入记忆 | `memory.upsert`（`silent_absorb`） |
 | ask（问） | 需要用户补充 | （无工具调用，触发 CLARIFY） |
 | ignore（忽略） | 不应打扰 | （无工具调用，触发 IGNORE） |
 
@@ -272,13 +272,26 @@ interface Tool {
 | Tool 族 | 能力 |
 |---------|------|
 | schedule | 日程/待办 CRUD、提醒偏移、重复事件 |
-| memory | 记忆读取、写入、检索（含 remember 静默写入） |
+| memory | 记忆检索/写入/删除（`memory.search` RAG 管道 / `memory.upsert` / `memory.list` / `memory.delete`）+ remember 静默写入 |
 | finance | 记账、预算、月度汇总 |
 | health | 健康记录、用药提醒 |
+| emotion | 情绪记录与趋势（支持 `emotion.query` 结构化检索） |
 | life | 天气、通勤、购物清单 |
 | device | 设备侧能力（通知、网络、定位等，受权限控制） |
 
 > 工具本身不含"业务智能"——是否调用、何时调用、如何组合由 Agent 动态决定；Tool 只按 Schema 确定性执行。
+
+#### 3.3.1 检索工具族（按 Retrieval Architecture 分类）
+
+按 §4.1 三源分类，工具的 **query/read 操作**归为检索族：
+
+| 检索族 | 工具 | 说明 |
+|--------|------|------|
+| **Structured** | `schedule.query` `finance.query` `health.query` `emotion.query` | 确定性事实，直接精确查询 SQLite；不 embedding |
+| **Memory** | `memory.search`（完整 RAG 管道，见 §4.2） | 语义记忆检索，FTS5 + sqlite-vec 双路 |
+| **External** | `knowledge/web.search`（P1 可选） | 联网知识，默认关闭异步、受权限约束 |
+
+> 原则：**结构化事实优先结构化查询，语义记忆才走 RAG**。Agent 不得用 memory.search 代替 schedule.query 等确定性查询（见 §4.1）。
 
 ### 3.4 运行时 / Policy Engine（确定性执行保障）
 
@@ -299,39 +312,130 @@ Agent 提供"想法"，运行时是"把守的关卡"：
 ### 3.6 存储层 (storage)
 - **主数据**：SQLite（端上主数据源）——日程、待办、记账、健康、情绪、记忆
 - **记忆向量**：储在 SQLite 中的轻量向量检索（sqlite-vec）
-- 提供统一 Repository 接口；每张表带 `updated_at` + `device_id` 用于同步
+- 提供统一 Repository 接口；每张表带 `updated_at`（墙钟展示）+ `device_id`（tie-break），LWW 判胜用 oplog 的 `hlc_timestamp`（HLC，见 04 §2.0.1）
+- 同步时间统一 HLC：写本地 DB 取 `HLC.now()`，客端为 `oplog.hlc_timestamp` 携带，按 `(hlc_timestamp, device_id)` 判胜；墙钟不参与冲突判胜
 
 ### 3.7 同步引擎 (sync)
-- 变更捕获：所有写操作经统一 `Repository`，自动写入 `oplog`（追加日志）
-- 上传/下载：接入云端 relay，拉取其它设备变更、推送本地变更
-- 冲突解决：按 `device_id` + 时钟/LWW：无冲突合并、同字段冲突采用更新时间较新者
+- 变更捕获：所有写操作经统一 `Repository`，自动写入 `oplog`（追加日志，`op_id` 全局唯一 UUID + `device_seq` 本机单调递增）
+- 上传/下载：接入云端 relay，按 `device_id` + `device_seq` 游标拉取其它设备变更、推送本地变更
+- 冲突解决：并发改同一行统一 **Row-level LWW：整行以 `hlc_timestamp`（HLC）较新者胜出覆盖**，不做 field-level 合并
 - 墓碑机制：删除不物理删，写 tombstone 以便广播到所有端
+- **Bootstrap（新设备）**：新建设备首次登录 → 从 relay 下载 **snapshot**（账户当前全量状态，含业务行 + tombstone）→ 应用 snapshot 之后补发的 **oplog** 增量 → 本地 SQLite ready。relay 幂等保存 oplog 全量并定期生成 snapshot；旧设备全离线时新设备仍能拿到历史数据。见 04 §6.1 Bootstrap 与回执游标
 
-## 4. 记忆系统（核心差异化，作为 Agent 上下文/工具）
+## 4. 记忆与检索架构（核心差异化，作为 Agent 上下文/工具）
 
-记忆系统为 Alfred 提供"管家在长期陪伴中记住你"的能力。在 Agent-native 架构下，记忆**以 Tool 形式暴露给 Agent**：Agent 需要时调用 `memory.search` 检索往事、`memory.save` 记录（含 remember 决策的静默吸收）。
+记忆系统为 Alfred 提供"管家在长期陪伴中记住你"的能力。在 Agent-native 架构下，记忆**以 Tool 形式暴露给 Agent**：Agent 需要时调用 `memory.search` 检索往事、`memory.upsert` 记录（含 remember 决策的静默吸收）。
 
-| 类型 | 说明 | 存储 |
-|------|------|------|
-| 结构化档案 | 姓名、生日、偏好、关系 | 结构化字段 / JSON |
-| 语义记忆 | "奶奶喜欢龙井" 等自由语义 | 向量 + 摘要 |
-| 会话记忆 | 最近 N 轮对话 | 短期缓存 |
-| 承诺/待办记忆 | 需要主动跟进的未完成事项 | 独立任务表 |
+> **承诺归记忆，执行归日程**：Memory 只保存"我承诺做什么"的认知事实（如"答应奶奶周末去看她"）；其落地执行（时间安排、提醒触发）由 `schedule` 表（`is_todo`）承担，两者以 `linked_schedule_id` 关联。**不在 Memory 里建第二套提醒/任务系统**。
 
-**记忆写入策略**：
-- 关键事实（时间、金额、人名）→ 结构化
-- 对话中自然出现的偏好 → 语义记忆
-- 写入前用户无感，但记忆可查询、可修正
+### 4.1 三种检索源（Retrieval Architecture）
+
+Agent 的信息检索分三类，**结构化事实优先结构化查询，语义记忆才走 RAG**：
+
+```
+Agent 需要信息
+ │
+ ├── Structured Retrieval   （确定性事实 → 结构化 Tool 查询）
+ │    ├── schedule.query    （日程/待办，支持未来是否冲突）
+ │    ├── finance.query     （账目/预算/月度汇总）
+ │    ├── health.query      （健康指标/用药记录）
+ │    └── emotion.query     （情绪趋势条目）
+ │
+ ├── Memory Retrieval       （语义记忆 → memory.search RAG 流水线）
+ │    └── memory.search(query)
+ │        ├── 走完整检索管道（见 4.2）
+ │        └── 结果含 recency/confidence/importance/有效期 因子
+ │
+ └── External Retrieval   （外部知识 → 联网检索，受权限与降级约束）
+       └── knowledge/web.search（P1 可选插件化，可关闭）
+```
+
+**结构化优先原则**：日程、财务、健康等**确定性事实**一律先查对应结构化 Tool（SQLite 精确字段），**不 embedding 化**。语义检索只用于**非结构化记忆**（"我上次体检结果""奶奶喜欢喝什么茶"）。Agent 负责在两者之间选择，遵循：
+
+> 需要确定性事实 → 结构化 Tool；需要语义联想 → memory.search；两者皆无 → External Retrieval（可选）。
+
+### 4.2 Memory Search 检索管道（冻结规范）
+
+`memory.search` 不是一次语义点查，而是一条固定流水线：
+
+```
+query
+ → Query Analysis        （拆解：命名实体 / 时间范围 / 类型 / 关键字）
+ → Metadata Filter       （user 已定；type / 时间窗口 / confidence 阈值 / status 默认 current）
+ → 双路召回
+    ├── SQLite FTS5   （词/字面 lexical，精确匹配迅速）
+    └── sqlite-vec    （记忆 embedding，按模型版本召回语义）
+ → merge                （两路结果合并，去重 deduplicate）
+ → rerank               （recency / confidence / importance / 有效期加权，均非 LLM）
+ → Top-K 截断
+ → Observation          （回到 Agent Loop）
+```
+
+**主版本过滤**：默认只召回 `status=current`（当前有效事实）；`superseded_by` 表明此条已被替代，只在「历史追溯」场景才显式检索。旧事实永久保留，但**默认不作为当前事实返回**。
+
+**有效期过滤**：命中 `valid_from` / `valid_until` 时间窗的事实，窗口已过期的先降级为 `status=obsolete`（或触发 Agent 确认是否续期），不进入排名。
+
+**双路说明**：FTS5 lexical 负责字面召回（人名/菜名/地点等强 token）；sqlite-vec 负责语义召回（同义/陌生表述）。两路 merge + dedupe 后按复合权重线性重排：
+
+- **recency（时效）**：`last_seen_at` / `updated_at` 越近越高
+- **confidence（置信）**：写入校验 + 用户修正递增
+- **importance（重要度）**：长期高价值事实（关系/承诺/偏好）显著高于短期琐事——权重最大
+- **有效期固有权重**：`valid_until` 临近/已过会降低当前有效性
+
+> 重排**不用 LLM**（成本与延迟）；LLM 只出现在 Query Analysis 阶段（把措辞化成结构化检索条件）。
+
+### 4.3 Agent 侧检索决策（在上游 Loop 中）
+
+`memory.search` 返回 Observation 后，**由 Agent 自主决定是否继续**：
+
+| 情况 | Agent 决策 |
+|------|-----------|
+| 结果足够回答 | 直接 FINAL_RESPONSE（引用记忆原文，供用户核对当前是否仍成立） |
+| 结果不够 / 缺失 | `memory.search` 改写 query 再次检索 |
+| 结果矛盾（新旧冲突） | 识别冲突事实链，展示新旧两版供用户确认 → 按用户选择写 supersede |
+| 需要确定性事实 | 切换 Structured 工具（schedule.query / finance.query 等），不查语义 |
+
+**supersede 统一流程**（新增事实 vs 已有事实，Agent 判定）：
+
+```
+新事实 X 与旧事实 Y 同主题冲突
+ → 检索命中 Y（status=current）
+ → 判定：X 是新事实(补充) / 冲突 / 替代 Y？
+   ├── 替代（supersede）：写 X(status=current, supersedes_id=Y)，Y 置为 superseded
+   ├── 补充：单独存 X，不改 Y
+   └── 冲突待决：问用户 → 用户选择后按替代处理
+```
+
+### 4.4 记忆写入策略
+
+- 关键事实（时间、金额、人名）→ 结构化（Structured 表）
+- 对话中自然出现的偏好/关系/情绪 → 语义记忆 `memory_fact`（content + FTS5 + embedding 多路）
+- 每次写留存 provenance（source_type / source_message_id / source_device_id / created_by）
+- 检测到同主题新事实时优先 **supersede 而非堆叠**（见 4.3），保证"当前事实"始终收敛
+- 写入前用户无感，但记忆可查询、可修正、可删除、可追踪（为何记得、何时替代谁）
+
 接口参考：
 
 ```ts
 interface MemoryStore {
-  saveFact(record: MemoryRecord): void
-  searchSemantic(query: string, k?: number): Promise<MemoryRecord[]>
-  listByType(type: MemoryType): Promise<MemoryRecord[]>
-  delete(id: string): Promise<void>
+  upsert(record: MemoryRecord): MemoryRef
+  //  传入：content + type + importance + confidence + provenance
+  //        + (可选) linked_schedule_id / supersedes_id / valid_from / valid_until
+  //  upsert 语义：同主题冲突时按 supersede 落库（新代旧，旧置 superseded），不简单堆叠
+  //  写入：FTS5 + memory_embedding（当前模型版本）+ status=current
+  search(query: string, opts: SearchOptions): Promise<RetrievedMem[]>
+  // opts: { type?; timeFrom?; timeTo?; validAt?; status?: 'current';
+  //         includeHistorical?: boolean（默认 false，仅 current）; k? }
+  list(filter: MemoryFilter): Promise<MemoryRecord[]>
+  // filter: { type?; status?; linkedScheduleId?; timeRange? }  （原 listByType 并入）
+  delete(id: string): Promise<void>   // 物理删除（受 provenance 保留约束）
+  // 附：rewriteQuery() / getHistory() 为查询辅助，不属于四接口
 }
 ```
+
+> **四接口约定**：`memory.search`（RAG 检索）/ `memory.upsert`（写，含 supersede）/ `memory.list`（筛选整页）/ `memory.delete`。Agent 感知的 Tool 名与此一一对应。`memory.upsert` 取代 `memory.add`/`memory.save`——"我不喜欢美式了" 是更新而非简单新增。
+
+> 记忆参与同步（多端共享档案）；embedding 存于独立 `memory_embedding` 表（按 model 版本），FTS5 索引用本地模型按需构建，不上云。更换 embedding 模型只重新生成向量，**不改写 memory_fact**。
 
 ## 5. 安全与隐私
 
@@ -358,7 +462,7 @@ interface MemoryStore {
 | 运行时决策护 | **Policy Engine（规则引擎）** | 权限/风险分级/确认门/写库，确定性执行 |
 | 语音合成 | 系统 TTS / edge-tts | 默认关闭不轰炸 |
 | LLM 接入 | OpenAI / Claude / 本地 OpenAI 兼容 | 灵活替换，默认可本地 |
-| 云端 | 账号 / 推送（FCM / APNs）/ relay | 薄云端，可指向官方或自建 |
+| 云端 | 账号 / 推送（FCM / APNs）/ relay（oplog + snapshot 持久化） | 薄云端但可重建：持久化同步副本，非业务权威 |
 | 双发行 | Flutter `--dart-define` / build flavor（`cloud` / `community`） | 同源码产两包，仅基础设施端点不同 |
 | 调度 | Dart chrono + `workmanager` | 三端后台提醒 |
 

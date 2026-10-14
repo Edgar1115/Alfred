@@ -87,9 +87,16 @@ Alfred 的能力按域拆分，组成"无论如何都能帮上忙"的全方位�
 |----|------|--------|------|
 | MEM-01 | 用户偏好记忆 | P0 | 「我喜欢喝美式」跨对话使用 |
 | MEM-02 | 人员档案 | P0 | 家人朋友：关系、生日、喜好 |
-| MEM-03 | 承诺与未竟事项记忆 | P0 | 「下周去看奶奶」→ 主动跟踪闭环 |
+| MEM-03 | 承诺与未竟事项记忆 | P0 | 「下周去看奶奶」记入记忆（认知事实）；执行/提醒落到 `schedule`（is_todo），通过 `linked_schedule_id` 关联——记忆不承担提醒 |
 | MEM-04 | 记忆检索与修正 | P1 | 用户可查、可改、可删记忆，防止幻觉扩错 |
 | MEM-05 | 记忆衰减与主张置信度 | P2 | 久远记忆降低权重 |
+| MEM-06 | 结构化优先检索 | P0 | 日程/财务/健康等确定性事实必须经 Structured Tool 精确查询，**不 embedding 化** |
+| MEM-07 | Memory RAG 管道 | P0 | `memory.search` 冻结为：Query Analysis → Metadata Filter → FTS5+sqlite-vec 双路 → merge → dedupe → rerank（recency/confidence/importance）→ Top-K → Observation |
+| MEM-08 | 检索自适应重试 | P0 | 结果不足时 Agent 改写 query 再检索；结果矛盾时拉取相关记忆；确定事实转 Structured 工具 |
+| MEM-09 | 外部知识检索（可选） | P1 | `knowledge/web.search` 默认关闭异步，可插件化启用，受权限约束 |
+| MEM-10 | 记忆版本语义（supersede） | P0 | 新事实可替代旧事实（"戒咖啡" 替代 "喜欢美式"）：旧记录保留历史，默认检索不返回；同主题冲突先问用户再落库；支持 `valid_from`/`valid_until` 时间窗口 |
+| MEM-11 | 来源追溯（provenance） | P0 | 每条记忆可追溯：`source_type` / `source_message_id` / `source_device_id` / `created_by`——能回答「Alfred 为什么记得这个」 |
+| MEM-12 | embedding 模型可演进 | P1 | embedding 存独立表（`memory_embedding: memory_id/model/dimension/embedding`），更换模型只重算向量、不改写事实；多版本向量共存 |
 
 ### 2.3 财务与健康追踪（P1）
 
@@ -136,6 +143,7 @@ Alfred 是**三端一管家**：电脑 / 手机 / 平板各自是完整应用，
 | MULTI-01 | 三端客户端 | P0 | 桌面（macOS/Windows/Linux）、手机（iOS/Android）、平板自适应；一套代码基座 |
 | MULTI-02 | 账号系统 | P0 | 同一账号登录所有端；未登录也可作为本地单机用 |
 | MULTI-03 | 数据自动同步 | P0 | 任意端改动，登录同账号的其他端自动同步；冲突可解决 |
+| MULTI-03b | 新设备 Bootstrap | P0 | 新设备首次登录即可重建历史状态（snapshot 全量 + oplog 增量），不依赖旧设备在线 |
 | MULTI-04 | 离线可用 | P0 | 断网时数据库本地照常增删查 + 提醒照常触发，联网后合冲 |
 | MULTI-05 | 自适应 UI | P0 | 出厂前各屏幕（含异形屏/刘海/折叠）都适配；横竖屏自动切换 |
 | MULTI-06 | 本地推送 | P1 | 本端提醒使用系统通知（手机/桌面/平板） |
@@ -189,7 +197,7 @@ Alfred 持续聆听，但**不是每句话都要行动**。**Agent 是唯一智�
 | 标签 | 含义 | 示例 |
 |------|------|------|
 | act（办） | 修改数据的写操作，经 Policy 确认门后执行，未确认不落库 | "明晚 7 点健身" → schedule.create |
-| remember（记） | 静默写入记忆，不打断 | "我喜欢喝美式" → memory.write |
+| remember（记） | 静默写入记忆，不打断 | "我喜欢喝美式" → memory.upsert |
 | query（查） | 只读查询，直接执行返回结果，**不进确认门** | "我下周安排" → schedule.query；"我奶奶喝什么茶" → memory.search |
 | ask（问） | 信息不足，触发 CLARIFY | "几点？在哪儿？" |
 | ignore（不理） | 无关内容，触发 IGNORE | 路边闲聊 |
